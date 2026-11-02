@@ -1,0 +1,75 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-ipa.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_16*.app /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project "SIM Anywhere.xcodeproj" -scheme SIMAnywhere \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ipa \
+            SIM_ANYWHERE_GIT_SHORT_HASH=$(git rev-parse --short HEAD) \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM="" \
+            build | tee build.log | grep -E "error:|warning: |BUILD" || true
+          test -d "build/ipa/Build/Products/Release-iphoneos/SIMAnywhere.app" || { tail -200 build.log; exit 1; }
+
+      - name: Package IPA
+        id: pkg
+        run: |
+          APP=build/ipa/Build/Products/Release-iphoneos/SIMAnywhere.app
+          VER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$APP/Info.plist")
+          BID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          echo "version=$VER build=$BUILD bundle=$BID"
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qry SIMAnywhere-unsigned.ipa Payload
+          ls -l SIMAnywhere-unsigned.ipa
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+          echo "bid=$BID" >> $GITHUB_OUTPUT
+          echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SIMAnywhere-unsigned-ipa
+          path: SIMAnywhere-unsigned.ipa
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.pkg.outputs.ver }}-build${{ steps.pkg.outputs.build }}-${{ steps.pkg.outputs.sha }}
+          name: SIM Anywhere ${{ steps.pkg.outputs.ver }} (${{ steps.pkg.outputs.build }}) unsigned
+          body: |
+            Unsigned IPA built by GitHub Actions from commit ${{ github.sha }}.
+            Bundle ID: ${{ steps.pkg.outputs.bid }}. Sign with AltStore / SideStore / your own certificate before installing.
+          files: SIMAnywhere-unsigned.ipa
